@@ -9,6 +9,7 @@ import qs.Common
 import qs.Modules.Plugins
 import qs.Services
 import qs.Widgets
+import "TaskbarModel.js" as TaskbarLogic
 
 PluginComponent {
     id: root
@@ -27,7 +28,7 @@ PluginComponent {
         case "hyprland":
             return Hyprland.focusedWorkspace?.monitor?.name || root.screenName;
         case "dwl":
-            return DwlService.activeOutput || root.screenName;
+            return typeof DwlService !== "undefined" ? (DwlService.activeOutput || root.screenName) : root.screenName;
         case "sway":
         case "scroll":
         case "miracle":
@@ -103,7 +104,7 @@ PluginComponent {
             }
             return filtered;
         } else if (CompositorService.isDwl) {
-            if (!DwlService.dwlAvailable) return [];
+            if (typeof DwlService === "undefined" || !DwlService.dwlAvailable) return [];
             const output = DwlService.getOutputState(root.effectiveScreenName);
             if (!output || !output.tags || output.tags.length === 0) return [];
             if (SettingsData.dwlShowAllTags) {
@@ -145,25 +146,6 @@ PluginComponent {
         return [];
     }
 
-    function getWindowWorkspaceId(w) {
-        if (CompositorService.isNiri) {
-            return w.niriWorkspaceId ?? w.workspace_id;
-        } else if (CompositorService.isSway || CompositorService.isScroll || CompositorService.isMiracle) {
-            return w.workspace?.num;
-        } else if (CompositorService.isDwl) {
-            // DWL doesn't expose per-window tag membership through the Wayland
-            // toplevel protocol. WorkspaceSwitcher.qml has the same limitation.
-            // groupByWorkspace() handles this with a fallback: tags with
-            // clients > 0 show all toplevels.
-            return undefined;
-        } else if (CompositorService.isHyprland) {
-            const hyprlandToplevels = Array.from(Hyprland.toplevels?.values || []);
-            const hyprToplevel = hyprlandToplevels.find(ht => ht.wayland === w);
-            return hyprToplevel?.workspace?.id;
-        }
-        return undefined;
-    }
-
     function getWorkspaceId(ws) {
         if (CompositorService.isNiri) {
             return ws.id;
@@ -191,74 +173,56 @@ PluginComponent {
         return false;
     }
 
-    function groupByWorkspace() {
-        const workspaces = getWorkspaceList();
-        const wins = CompositorService.sortedToplevels;
-        const result = [];
+    // Service reads stay here; the model adapter is usable without a DMS session.
+    // Snapshots may run on focus changes, but unchanged structural arrays survive.
+    property int _dwlStateRevision: 0
+    property int _toplevelRevision: 0
+    Connections {
+        target: CompositorService
+        function onToplevelsChanged() { root._toplevelRevision++; }
+    }
+    Connections {
+        // Newer DMS versions renamed this backend; do not resolve an absent
+        // legacy service while running another compositor (notably Niri).
+        target: CompositorService.isDwl && typeof DwlService !== "undefined" ? DwlService : null
+        function onStateChanged() { root._dwlStateRevision++; }
+    }
 
-        for (let i = 0; i < workspaces.length; i++) {
-            const ws = workspaces[i];
-            const wsId = getWorkspaceId(ws);
-            if (wsId === undefined) continue;
-
-            let wsWindows = [];
-            if (CompositorService.isDwl) {
-                // DWL fallback: no per-window tag matching available.
-                // Show all toplevels for tags that have clients > 0.
-                // This is the best approximation — matches WorkspaceSwitcher behavior.
-                if (ws.clients > 0) {
-                    wsWindows = Array.from(wins);
-                }
-            } else {
-                for (let j = 0; j < wins.length; j++) {
-                    const w = wins[j];
-                    if (!w) continue;
-                    const winWsId = getWindowWorkspaceId(w);
-                    if (winWsId === wsId) {
-                        wsWindows.push(w);
-                    }
-                }
-            }
-
-            const isActive = isWorkspaceActive(ws);
-
-            if (wsWindows.length === 0 && !isActive) continue;
-
-            let entries;
-            if (root.groupByApp) {
-                const appGroups = new Map();
-                wsWindows.forEach((w) => {
-                    const moddedId = Paths.moddedAppId(w.appId || "unknown");
-                    if (!appGroups.has(moddedId)) {
-                        appGroups.set(moddedId, {
-                            "isGrouped": true,
-                            "appId": moddedId,
-                            "entryKey": moddedId,
-                            "windows": [],
-                            "toplevel": w
-                        });
-                    }
-                    appGroups.get(moddedId).windows.push(w);
-                });
-                entries = Array.from(appGroups.values());
-            } else {
-                entries = wsWindows.map((w, idx) => ({
-                    "isGrouped": false,
-                    "appId": Paths.moddedAppId(w.appId || "unknown"),
-                    "entryKey": Paths.moddedAppId(w.appId || "unknown") + "::" + idx,
-                    "windows": [w],
-                    "toplevel": w
-                }));
-            }
-
-            result.push({
-                "workspace": ws,
-                "workspaceId": wsId,
-                "entries": entries,
-                "isActive": isActive
+    readonly property var taskbarSnapshot: {
+        const compositor = CompositorService.compositor;
+        root._toplevelRevision;
+        if (CompositorService.isDwl) root._dwlStateRevision;
+        root._appIdSubstitutionsTrigger;
+        const workspaces = getWorkspaceList().map(ws => ({
+            workspaceId: getWorkspaceId(ws), workspace: ws,
+            active: isWorkspaceActive(ws), hasClients: ws.clients > 0
+        }));
+        // One Hyprland lookup table per snapshot, never a search per window.
+        const membership = CompositorService.isHyprland
+            ? TaskbarLogic.buildHyprlandLookup(Array.from(Hyprland.toplevels?.values || []))
+            : null;
+        const windows = [];
+        // Identity allocation uses ALL windows, before workspace/output filtering.
+        for (const w of CompositorService.sortedToplevels || []) {
+            if (!w) continue;
+            let workspaceId;
+            if (CompositorService.isNiri) workspaceId = w.niriWorkspaceId ?? w.workspace_id;
+            else if (CompositorService.isHyprland) workspaceId = membership.get(w);
+            else if (CompositorService.isSway || CompositorService.isScroll || CompositorService.isMiracle)
+                workspaceId = w.workspace?.num;
+            windows.push({
+                toplevel: w, niriWindowId: CompositorService.isNiri ? w.niriWindowId : undefined,
+                workspaceId: workspaceId, appId: Paths.moddedAppId(w.appId || "unknown"),
+                title: w.title || "(Unnamed)", focused: !!(w.activated || w.is_focused),
+                activated: !!w.activated
             });
         }
-        return result;
+        return { compositor: compositor, workspaces: workspaces, windows: windows, groupByApp: root.groupByApp };
+    }
+
+    TaskbarModel {
+        id: taskbarModel
+        snapshot: root.taskbarSnapshot
     }
 
     function switchToWorkspace(ws) {
@@ -268,20 +232,14 @@ PluginComponent {
         } else if (CompositorService.isHyprland) {
             Hyprland.dispatch(`workspace ${ws.id}`);
         } else if (CompositorService.isDwl) {
-            DwlService.setTags(root.effectiveScreenName, 1 << ws.tag, 0);
+            if (typeof DwlService !== "undefined")
+                DwlService.setTags(root.effectiveScreenName, 1 << ws.tag, 0);
         } else if (CompositorService.isSway || CompositorService.isScroll || CompositorService.isMiracle) {
             I3.dispatch(`workspace number ${ws.num}`);
         }
     }
 
-    readonly property var groupedWorkspaces: {
-        CompositorService.toplevelsChanged;
-        if (typeof NiriService !== 'undefined') NiriService.allWorkspaces;
-        if (typeof Hyprland !== 'undefined') Hyprland.workspaces;
-        if (typeof I3 !== 'undefined') I3.workspaces;
-        if (typeof DwlService !== 'undefined') DwlService.stateChanged;
-        return groupByWorkspace();
-    }
+    readonly property var groupedWorkspaces: taskbarModel.visibleWorkspaces
 
     property var _pendingContextMenu: null
 
@@ -290,25 +248,39 @@ PluginComponent {
         active: false
         onLoaded: {
             if (root._pendingContextMenu && item) {
-                item.currentWindow = root._pendingContextMenu.window;
-                item.showAt(root._pendingContextMenu.x, root._pendingContextMenu.y, root.isVertical, root.axis?.edge);
+                const pending = root._pendingContextMenu;
+                item.showAt(pending.x, pending.y, root.isVertical, root.axis?.edge,
+                    pending.entryRecord, pending.entryKey);
                 root._pendingContextMenu = null;
             }
         }
         sourceComponent: PanelWindow {
             id: contextMenuWindow
 
-            property var currentWindow: null
+            property var currentEntryRecord: null
+            property string currentEntryKey: ""
+            property var desktopEntry: currentEntryRecord && currentEntryRecord.appId
+                ? DesktopEntries.heuristicLookup(currentEntryRecord.appId) : null
             property bool isVisible: false
             property point anchorPos: Qt.point(0, 0)
             property bool isVertical: false
             property string edge: "bottom"
+            readonly property bool windowSelectionVisible: root.groupByApp && currentEntryRecord
+                && currentEntryRecord.isGrouped && (currentEntryRecord.payloads || []).length > 1
+            readonly property bool hasDesktopActions: desktopEntry && desktopEntry.actions
+                && desktopEntry.actions.length > 0
+            readonly property bool hasWindows: currentEntryRecord && (currentEntryRecord.windows || []).length > 0
+            readonly property bool closeAllVisible: root.groupByApp && currentEntryRecord
+                && currentEntryRecord.isGrouped && (currentEntryRecord.windows || []).length > 1
+            readonly property real menuMaxHeight: Math.max(1, contextMenuWindow.height - 20)
 
-            function showAt(x, y, vertical, barEdge) {
+            function showAt(x, y, vertical, barEdge, entryRecord, entryKey) {
                 screen = root.parentScreen;
                 anchorPos = Qt.point(x, y);
                 isVertical = vertical ?? false;
                 edge = barEdge ?? "bottom";
+                currentEntryRecord = entryRecord || null;
+                currentEntryKey = entryKey || (entryRecord ? entryRecord.entryKey : "");
                 isVisible = true;
                 visible = true;
                 if (screen) {
@@ -316,9 +288,18 @@ PluginComponent {
                 }
             }
 
+            function launchDesktopAction(action) {
+                // SessionService also validates command, but keep this guard at
+                // the menu boundary so malformed desktop actions never execute.
+                if (desktopEntry && action && action.command)
+                    SessionService.launchDesktopAction(desktopEntry, action);
+            }
+
             function close() {
                 isVisible = false;
                 visible = false;
+                currentEntryRecord = null;
+                currentEntryKey = "";
                 windowContextMenuLoader.active = false;
                 if (screen) {
                     TrayMenuManager.unregisterMenu(screen.name);
@@ -358,47 +339,249 @@ PluginComponent {
             }
 
             Rectangle {
+                id: contextMenuContainer
+                z: 1
                 x: {
-                    const left = 10;
-                    const right = contextMenuWindow.width - width - 10;
+                    if (contextMenuWindow.isVertical) {
+                        if (contextMenuWindow.edge === "left")
+                            return Math.max(10, Math.min(contextMenuWindow.width - width - 10, contextMenuWindow.anchorPos.x));
+                        return Math.max(10, Math.min(contextMenuWindow.width - width - 10,
+                            contextMenuWindow.anchorPos.x - width));
+                    }
                     const want = contextMenuWindow.anchorPos.x - width / 2;
-                    return Math.max(left, Math.min(right, want));
+                    return Math.max(10, Math.min(contextMenuWindow.width - width - 10, want));
                 }
-                y: contextMenuWindow.anchorPos.y
-                width: 100
-                height: 32
-                color: Theme.withAlpha(Theme.surfaceContainer, Theme.popupTransparency)
+                y: {
+                    if (contextMenuWindow.isVertical) {
+                        const want = contextMenuWindow.anchorPos.y - height / 2;
+                        return Math.max(10, Math.min(contextMenuWindow.height - height - 10, want));
+                    }
+                    if (contextMenuWindow.edge === "top")
+                        return Math.min(contextMenuWindow.height - height - 10, contextMenuWindow.anchorPos.y);
+                    return Math.max(10, contextMenuWindow.anchorPos.y - height);
+                }
+                width: Math.min(360, Math.max(180, menuColumn.implicitWidth + Theme.spacingS * 2))
+                height: Math.min(
+                    Math.max(60, menuFlickable.contentHeight + Theme.spacingS * 2),
+                    contextMenuWindow.menuMaxHeight)
+                // Menus must remain readable even with a transparent bar theme.
+                color: Qt.rgba(Theme.surfaceContainer.r, Theme.surfaceContainer.g, Theme.surfaceContainer.b, 1)
                 radius: Theme.cornerRadius
                 border.width: 1
                 border.color: Qt.rgba(Theme.outline.r, Theme.outline.g, Theme.outline.b, 0.12)
 
-                Rectangle {
+                Flickable {
+                    id: menuFlickable
                     anchors.fill: parent
-                    radius: parent.radius
-                    color: ctxCloseMouseArea.containsMouse ? Theme.widgetBaseHoverColor : "transparent"
-                }
+                    anchors.margins: Theme.spacingS
+                    clip: true
+                    contentWidth: width
+                    contentHeight: menuColumn.implicitHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    flickableDirection: Flickable.VerticalFlick
+                    interactive: contentHeight > height
 
-                StyledText {
-                    anchors.centerIn: parent
-                    text: I18n.tr("Close")
-                    font.pixelSize: Theme.fontSizeSmall
-                    color: Theme.widgetTextColor
-                }
+                    Column {
+                        id: menuColumn
+                        width: menuFlickable.width
+                        spacing: 1
 
-                MouseArea {
-                    id: ctxCloseMouseArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        if (contextMenuWindow.currentWindow) {
-                            contextMenuWindow.currentWindow.close();
+                    Repeater {
+                        model: contextMenuWindow.windowSelectionVisible
+                            ? contextMenuWindow.currentEntryRecord.payloads : []
+
+                        Rectangle {
+                            width: parent.width
+                            height: 28
+                            radius: Theme.cornerRadius
+                            color: windowArea.containsMouse
+                                ? Theme.widgetBaseHoverColor : "transparent"
+
+                            StyledText {
+                                anchors.left: parent.left
+                                anchors.leftMargin: Theme.spacingS
+                                anchors.right: windowCloseButton.left
+                                anchors.rightMargin: Theme.spacingXS
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData && modelData.title
+                                    ? modelData.title : I18n.tr("(Unnamed)")
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.widgetTextColor
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+
+                            Rectangle {
+                                id: windowCloseButton
+                                anchors.right: parent.right
+                                anchors.rightMargin: Theme.spacingXS
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 20
+                                height: 20
+                                radius: 10
+                                color: windowCloseArea.containsMouse
+                                    ? Theme.errorPressed : "transparent"
+
+                                DankIcon {
+                                    anchors.centerIn: parent
+                                    name: "close"
+                                    size: 12
+                                    color: windowCloseArea.containsMouse
+                                        ? Theme.error : Theme.widgetTextColor
+                                }
+
+                                MouseArea {
+                                    id: windowCloseArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        if (contextMenuWindow.currentEntryRecord && modelData)
+                                            contextMenuWindow.currentEntryRecord.closeWindow(modelData.key);
+                                        contextMenuWindow.close();
+                                    }
+                                }
+                            }
+
+                            MouseArea {
+                                id: windowArea
+                                anchors.fill: parent
+                                anchors.rightMargin: 24
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    if (contextMenuWindow.currentEntryRecord && modelData)
+                                        contextMenuWindow.currentEntryRecord.activateWindow(modelData.key);
+                                    contextMenuWindow.close();
+                                }
+                            }
                         }
-                        contextMenuWindow.close();
+                    }
+
+                    Rectangle {
+                        visible: contextMenuWindow.windowSelectionVisible
+                        width: parent.width
+                        height: 1
+                        color: Theme.outline
+                    }
+
+                    Repeater {
+                        model: contextMenuWindow.hasDesktopActions
+                            ? contextMenuWindow.desktopEntry.actions : []
+
+                        Rectangle {
+                            width: parent.width
+                            height: 28
+                            radius: Theme.cornerRadius
+                            color: actionArea.containsMouse
+                                ? Theme.widgetBaseHoverColor : "transparent"
+
+                            StyledText {
+                                anchors.left: parent.left
+                                anchors.leftMargin: Theme.spacingS
+                                anchors.right: parent.right
+                                anchors.rightMargin: Theme.spacingS
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData && modelData.name ? modelData.name : ""
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.widgetTextColor
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+
+                            MouseArea {
+                                id: actionArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    contextMenuWindow.launchDesktopAction(modelData);
+                                    contextMenuWindow.close();
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        visible: contextMenuWindow.hasDesktopActions
+                        width: parent.width
+                        height: 1
+                        color: Theme.outline
+                    }
+
+                    Rectangle {
+                        visible: contextMenuWindow.hasWindows
+                        width: parent.width
+                        height: 28
+                        radius: Theme.cornerRadius
+                        color: closeArea.containsMouse
+                            ? Theme.widgetBaseHoverColor : "transparent"
+
+                        StyledText {
+                            anchors.left: parent.left
+                            anchors.leftMargin: Theme.spacingS
+                            anchors.right: parent.right
+                            anchors.rightMargin: Theme.spacingS
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: I18n.tr("Close")
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.widgetTextColor
+                            elide: Text.ElideRight
+                            maximumLineCount: 1
+                        }
+
+                        MouseArea {
+                            id: closeArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (contextMenuWindow.currentEntryRecord)
+                                    contextMenuWindow.currentEntryRecord.closeRepresentative();
+                                contextMenuWindow.close();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        visible: contextMenuWindow.closeAllVisible
+                        width: parent.width
+                        height: 28
+                        radius: Theme.cornerRadius
+                        color: closeAllArea.containsMouse
+                            ? Theme.errorHover : "transparent"
+
+                        StyledText {
+                            anchors.left: parent.left
+                            anchors.leftMargin: Theme.spacingS
+                            anchors.right: parent.right
+                            anchors.rightMargin: Theme.spacingS
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: I18n.tr("Close All")
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: closeAllArea.containsMouse
+                                ? Theme.error : Theme.widgetTextColor
+                            elide: Text.ElideRight
+                            maximumLineCount: 1
+                        }
+
+                        MouseArea {
+                            id: closeAllArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (contextMenuWindow.currentEntryRecord)
+                                    contextMenuWindow.currentEntryRecord.closeAllWindows();
+                                contextMenuWindow.close();
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
     }
 
     // Compute the BasePill padding so we can compensate with negative margins
@@ -425,7 +608,7 @@ PluginComponent {
                         id: wsPill
 
                         property var wsData: modelData
-                        property bool isActive: wsData ? wsData.isActive : false
+                        property bool isActive: wsData ? wsData.active : false
 
                         readonly property real pillInset: Math.max(root.iconPadding, Theme.spacingXS)
                         width: innerLayout.implicitWidth + pillInset * 2
@@ -491,7 +674,7 @@ PluginComponent {
                         id: wsPillV
 
                         property var wsData: modelData
-                        property bool isActive: wsData ? wsData.isActive : false
+                        property bool isActive: wsData ? wsData.active : false
 
                         anchors.horizontalCenter: parent.horizontalCenter
                         width: root.filledPills ? (root.widgetThickness - Theme.spacingS * 0.9) : root.iconCellSize
@@ -550,7 +733,7 @@ PluginComponent {
             property int windowCount: entryData ? entryData.windows.length : 0
             property string appId: entryData ? entryData.appId : ""
             readonly property string effectiveAppId: appId
-            property string windowTitle: toplevelData ? (toplevelData.title || "(Unnamed)") : "(Unnamed)"
+            property string windowTitle: entryData ? entryData.title : "(Unnamed)"
             property var coreAppData: {
                 if (appEntry.appId !== "org.quickshell" || !appEntry.windowTitle)
                     return null;
@@ -563,13 +746,7 @@ PluginComponent {
             }
             readonly property bool isCoreApp: coreAppData !== null
             readonly property bool isVerticalEntry: parent && parent.objectName === "verticalEntries"
-            property bool isFocused: {
-                if (!entryData) return false;
-                for (let i = 0; i < entryData.windows.length; i++) {
-                    if (entryData.windows[i].activated || entryData.windows[i].is_focused) return true;
-                }
-                return false;
-            }
+            property bool isFocused: entryData ? entryData.focused : false
             readonly property real entryIconSize: Theme.barIconSize(root.barThickness, undefined, root.barConfig?.maximizeWidgetIcons, root.barConfig?.iconScale)
 
             width: root.compactMode ? entryIconSize + root.iconPadding * 2 : entryIconSize + root.iconPadding * 3 + 120
@@ -687,27 +864,10 @@ PluginComponent {
                 }
                 onClicked: mouse => {
                     if (mouse.button === Qt.LeftButton) {
-                        if (appEntry.isGrouped && appEntry.windowCount > 1) {
-                            let currentIndex = -1;
-                            for (let i = 0; i < appEntry.entryData.windows.length; i++) {
-                                if (appEntry.entryData.windows[i].activated) {
-                                    currentIndex = i;
-                                    break;
-                                }
-                            }
-                            const nextIndex = (currentIndex + 1) % appEntry.entryData.windows.length;
-                            appEntry.entryData.windows[nextIndex].activate();
-                        } else if (appEntry.toplevelData) {
-                            appEntry.toplevelData.activate();
-                        }
+                        if (appEntry.entryData) appEntry.entryData.activateNext();
                     } else if (mouse.button === Qt.MiddleButton) {
-                        if (appEntry.toplevelData) {
-                            if (typeof appEntry.toplevelData.close === "function") {
-                                appEntry.toplevelData.close();
-                            }
-                        }
+                        if (appEntry.entryData) appEntry.entryData.closeRepresentative();
                     } else if (mouse.button === Qt.RightButton) {
-                        const toplevel = appEntry.entryData ? appEntry.entryData.toplevel : null;
                         const globalPos = appEntry.mapToGlobal(appEntry.width / 2, 0);
                         const screenX = root.parentScreen ? root.parentScreen.x : 0;
                         const screenY = root.parentScreen ? root.parentScreen.y : 0;
@@ -721,14 +881,17 @@ PluginComponent {
                         } else {
                             const relativeX = globalPos.x - screenX;
                             const screenHeight = root.parentScreen ? root.parentScreen.height : 1080;
-                            const isBottom = root.axis?.edge === "bottom";
+                            const isBottom = (root.axis?.edge ?? "bottom") === "bottom";
                             menuX = relativeX;
+                            // The menu now subtracts its measured height for a
+                            // bottom bar; do not retain the old fixed 32px row.
                             menuY = isBottom
-                                ? (screenHeight - root.barThickness - root.barSpacing - 32 - Theme.spacingXS)
+                                ? (screenHeight - root.barThickness - root.barSpacing - Theme.spacingXS)
                                 : (root.barThickness + root.barSpacing + Theme.spacingXS);
                         }
                         root._pendingContextMenu = {
-                            "window": toplevel,
+                            "entryRecord": appEntry.entryData,
+                            "entryKey": appEntry.entryData ? appEntry.entryData.entryKey : "",
                             "x": menuX,
                             "y": menuY
                         };

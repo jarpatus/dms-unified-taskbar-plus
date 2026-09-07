@@ -4,6 +4,8 @@ const path = require("node:path");
 const test = require("node:test");
 
 const qml = readFileSync(path.join(__dirname, "..", "UnifiedTaskbar.qml"), "utf8");
+const entryRecordQml = readFileSync(path.join(__dirname, "..", "EntryRecord.qml"), "utf8");
+const modelQml = readFileSync(path.join(__dirname, "..", "TaskbarModel.qml"), "utf8");
 
 function countOccurrences(source, needle) {
     let count = 0;
@@ -179,6 +181,51 @@ test("workspace_switching_preserves_other_compositor_targets", () => {
     );
 });
 
+test("context_menu_preserves_grouped_selection_actions_close_and_positioning", () => {
+    assert.match(qml, /readonly property bool windowSelectionVisible: root\.groupByApp/);
+    assert.match(qml, /currentEntryRecord\.payloads/);
+    assert.match(qml, /currentEntryRecord\.activateWindow\(modelData\.key\)/);
+    assert.match(qml, /currentEntryRecord\.closeWindow\(modelData\.key\)/);
+    assert.match(qml, /desktopEntry\.actions/);
+    assert.match(qml, /SessionService\.launchDesktopAction\(desktopEntry, action\)/);
+    assert.match(qml, /if \(desktopEntry && action && action\.command\)/);
+    assert.match(qml, /text: I18n\.tr\("Close"\)/);
+    assert.match(qml, /text: I18n\.tr\("Close All"\)/);
+    assert.match(qml, /readonly property bool closeAllVisible: root\.groupByApp/);
+    assert.match(qml, /currentEntryRecord\.closeAllWindows\(\)/);
+    assert.match(qml, /width: Math\.min\(360, Math\.max\(180, menuColumn\.implicitWidth/);
+    assert.match(qml, /height: Math\.min\(/);
+    assert.match(qml, /menuFlickable\.contentHeight \+ Theme\.spacingS \* 2/);
+    assert.match(qml, /id: menuFlickable/);
+    assert.match(qml, /clip: true/);
+    assert.match(qml, /contentHeight: menuColumn\.implicitHeight/);
+    assert.match(qml, /boundsBehavior: Flickable\.StopAtBounds/);
+    assert.match(qml, /interactive: contentHeight > height/);
+    assert.match(qml, /contextMenuWindow\.anchorPos\.y - height \/ 2/);
+    assert.match(qml, /contextMenuWindow\.edge === "top"/);
+    assert.doesNotMatch(qml, /currentWindow/);
+});
+
+test("entry_record_methods_resolve_current_wrappers_and_guard_close_all", () => {
+    assert.match(entryRecordQml, /function _indexForKey\(key\)/);
+    assert.match(entryRecordQml, /function activateWindow\(key\)/);
+    assert.match(entryRecordQml, /function closeWindow\(key\)/);
+    assert.match(entryRecordQml, /if \(!isGrouped \|\| current\.length <= 1\) return false/);
+    assert.match(entryRecordQml, /target\[method\]\(\)/);
+    assert.match(entryRecordQml, /property var payloads: \[\]/);
+    const payloadCompareIndex = modelQml.indexOf("var payloadsChanged =");
+    const payloadAllocateIndex = modelQml.indexOf("var payloadSnapshot = [];");
+    assert.ok(payloadCompareIndex !== -1 && payloadCompareIndex < payloadAllocateIndex,
+        "payload scalar comparison must precede snapshot allocation");
+    assert.match(modelQml, /currentPayload\.key !== sourcePayload\.key/);
+    assert.match(modelQml, /currentPayload\.title !== \(sourcePayload\.title \|\| \"\"\)/);
+    assert.match(modelQml, /currentPayload\.appId !== \(sourcePayload\.appId \|\| \"unknown\"\)/);
+    assert.match(modelQml, /currentPayload\.focused !== \(sourcePayload\.focused === true\)/);
+    assert.match(modelQml, /currentPayload\.activated !== \(sourcePayload\.activated === true\)/);
+    assert.match(modelQml, /if \(payloadsChanged\) \{/);
+    assert.match(modelQml, /_setProperty\(record, "payloads", payloadSnapshot\)/);
+});
+
 test("workspace_pill_handlers_preserve_shared_dispatch_and_app_activation", () => {
     assert.match(horizontalWorkspaceMouseArea, /root\.switchToWorkspace\(wsPill\.wsData \? wsPill\.wsData\.workspace : null\)/);
     assert.match(verticalWorkspaceMouseArea, /root\.switchToWorkspace\(wsPillV\.wsData \? wsPillV\.wsData\.workspace : null\)/);
@@ -187,13 +234,13 @@ test("workspace_pill_handlers_preserve_shared_dispatch_and_app_activation", () =
     assert.ok(!appEntryClickHandler.includes(horizontalWorkspaceMouseArea));
     assert.ok(!appEntryClickHandler.includes(verticalWorkspaceMouseArea));
 
-    const groupedCondition = appEntryClickHandler.indexOf("if (appEntry.isGrouped && appEntry.windowCount > 1)");
-    const groupedCycle = appEntryClickHandler.indexOf("appEntry.entryData.windows[nextIndex].activate()");
-    const directCondition = appEntryClickHandler.indexOf("else if (appEntry.toplevelData)");
-    const directActivation = appEntryClickHandler.indexOf("appEntry.toplevelData.activate()");
-
-    assert.ok(groupedCondition >= 0, "app clicks must retain grouped-window detection");
-    assert.ok(groupedCondition < groupedCycle, "grouped-window cycling must follow grouped detection");
-    assert.ok(groupedCycle < directCondition, "direct activation must remain the fallback after grouped cycling");
-    assert.ok(directCondition < directActivation, "direct activation must follow the toplevel guard");
+    // These production record methods are exercised with current-wrapper spies
+    // by the real QML suite, including grouped cycling and direct activation.
+    assert.match(appEntryClickHandler, /Qt\.LeftButton\)\s*\{\s*if \(appEntry\.entryData\) appEntry\.entryData\.activateNext\(\)/);
+    assert.match(appEntryClickHandler, /Qt\.MiddleButton\)\s*\{\s*if \(appEntry\.entryData\) appEntry\.entryData\.closeRepresentative\(\)/);
+    assert.match(appEntryClickHandler, /Qt\.RightButton\)\s*\{/);
+    assert.doesNotMatch(appEntryClickHandler, /contextTarget\(\)/);
+    assert.match(appEntryClickHandler, /"entryRecord": appEntry\.entryData/);
+    assert.match(appEntryClickHandler, /"entryKey": appEntry\.entryData \? appEntry\.entryData\.entryKey/);
+    assert.doesNotMatch(appEntryClickHandler, /toplevelData\.(activate|close)\(/);
 });
