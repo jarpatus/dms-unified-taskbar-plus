@@ -48,6 +48,7 @@ PluginComponent {
     readonly property real iconPadding: pluginData.iconPadding !== undefined ? pluginData.iconPadding : Theme.spacingS
     readonly property real itemSpacing: pluginData.itemSpacing !== undefined ? pluginData.itemSpacing : Theme.spacingXS
     readonly property real workspaceSpacing: pluginData.workspaceSpacing !== undefined ? pluginData.workspaceSpacing : Theme.spacingXS
+    readonly property real titleWidth: pluginData.titleWidth !== undefined ? pluginData.titleWidth : 120
 
     readonly property real iconCellSize: widgetThickness - ((barConfig?.removeWidgetPadding ?? false) ? 0 : Theme.snap((barConfig?.widgetPadding ?? 12) * (widgetThickness / 30), 1)) * 2
 
@@ -223,6 +224,7 @@ PluginComponent {
     TaskbarModel {
         id: taskbarModel
         snapshot: root.taskbarSnapshot
+        titleRewrites: pluginData.titleRewrites ?? []
     }
 
     function switchToWorkspace(ws) {
@@ -749,7 +751,7 @@ PluginComponent {
             property bool isFocused: entryData ? entryData.focused : false
             readonly property real entryIconSize: Theme.barIconSize(root.barThickness, undefined, root.barConfig?.maximizeWidgetIcons, root.barConfig?.iconScale)
 
-            width: root.compactMode ? entryIconSize + root.iconPadding * 2 : entryIconSize + root.iconPadding * 3 + 120
+            width: root.compactMode ? entryIconSize + root.iconPadding * 2 : entryIconSize + root.iconPadding * 3 + root.titleWidth
             height: root.compactMode && isVerticalEntry ? entryIconSize + root.iconPadding * 2 : Math.round((root.iconCellSize + root.widgetThickness) / 2)
 
             Rectangle {
@@ -774,6 +776,8 @@ PluginComponent {
                     source: {
                         root._desktopEntriesUpdateTrigger;
                         root._appIdSubstitutionsTrigger;
+                        if (appEntry.entryData && appEntry.entryData.icon)
+                            return appEntry.entryData.icon;
                         if (appEntry.isCoreApp && appEntry.coreAppData && appEntry.coreAppData.icon)
                             return Quickshell.iconPath(appEntry.coreAppData.icon, true) || "";
                         if (!appEntry.effectiveAppId)

@@ -48,6 +48,43 @@ function identityForWindow(record, compositor, state) {
     return state.objectKeys.get(object);
 }
 
+/* Fallback rules when no user-configured rewrites are supplied. */
+var DEFAULT_TITLE_REWRITES = [
+    { pattern: ".*facebook\\.com.*", flags: "i", title: "Facebook", icon: "file:///home/jari/.local/share/icons/hicolor/256x256/apps/Facebook.png" }
+];
+
+/* Compiles user-supplied {pattern, flags, title, icon} rows into usable regexes; bad patterns are skipped. */
+function compileTitleRewrites(rules) {
+    var compiled = [];
+    var source = Array.isArray(rules) && rules.length ? rules : DEFAULT_TITLE_REWRITES;
+    for (var i = 0; i < source.length; i++) {
+        var rule = source[i] || {};
+        if (!rule.pattern) continue;
+        var icon = rule.icon || "";
+        if (icon && icon.indexOf("://") < 0) icon = "file://" + icon;
+        try {
+            compiled.push({ test: new RegExp(rule.pattern, rule.flags || "i"), title: rule.title || "", icon: icon });
+        } catch (e) { /* invalid regex from settings, skip */ }
+    }
+    return compiled;
+}
+
+function _matchTitleRewrite(title, rules) {
+    for (var i = 0; i < rules.length; i++)
+        if (rules[i].test.test(title)) return rules[i];
+    return null;
+}
+
+function applyTitleRewrites(title, rules) {
+    var rule = _matchTitleRewrite(title, rules);
+    return rule && rule.title ? rule.title : title;
+}
+
+function iconForTitle(rawTitle, rules) {
+    var rule = _matchTitleRewrite(rawTitle, rules);
+    return rule ? rule.icon : "";
+}
+
 function normalizeAppId(value, normalizer) {
     var raw = value === null || value === undefined || value === "" ? "unknown" : value;
     if (typeof normalizer === "function") raw = normalizer(raw);
@@ -72,13 +109,16 @@ function _window(record, compositor, state, options) {
     var workspaceId = record.workspaceId;
     if (workspaceId === undefined && options && options.hyprlandLookup && options.hyprlandLookup.has(object))
         workspaceId = options.hyprlandLookup.get(object);
+    var rawTitle = record.title === null || record.title === undefined ? "" : String(record.title);
+    var rewriteRules = (options && options.compiledTitleRewrites) || compileTitleRewrites();
     return {
         key: identityForWindow(record, compositor, state),
         toplevel: record.toplevel === undefined ? record : record.toplevel,
         niriWindowId: record.niriWindowId,
         workspaceId: workspaceId,
         appId: normalizeAppId(record.appId, options && options.normalizeAppId),
-        title: record.title === null || record.title === undefined ? "" : String(record.title),
+        title: applyTitleRewrites(rawTitle, rewriteRules),
+        icon: iconForTitle(rawTitle, rewriteRules),
         focused: record.focused === true,
         activated: record.activated === true,
         source: record
@@ -89,6 +129,7 @@ function _finishEntry(entry) {
     var first = entry.windows[0] || null;
     entry.toplevel = first ? first.toplevel : null;
     entry.title = first ? first.title : "";
+    entry.icon = first ? first.icon : "";
     entry.focused = false;
     entry.activatedWindowIndex = -1;
     for (var i = 0; i < entry.windows.length; i++) {
@@ -136,6 +177,7 @@ function _copyWindowPayload(target, source) {
     target.workspaceId = source.workspaceId;
     target.appId = source.appId;
     target.title = source.title;
+    target.icon = source.icon;
     target.focused = source.focused;
     target.activated = source.activated;
     target.source = source.source;
@@ -146,6 +188,7 @@ function _refreshEntry(entry) {
     var first = entry.windows[0] || null;
     entry.toplevel = first ? first.toplevel : null;
     entry.title = first ? first.title : "";
+    entry.icon = first ? first.icon : "";
     entry.focused = false;
     entry.activatedWindowIndex = -1;
     for (var i = 0; i < entry.windows.length; i++) {
@@ -194,6 +237,7 @@ function bucketSnapshot(snapshot, identityState, options) {
     var compositor = snapshot.compositor === undefined || snapshot.compositor === null ? "unknown" : String(snapshot.compositor);
     identityState = ensureIdentityState(identityState, compositor);
     identityState.liveObjects = new Set();
+    var compiledTitleRewrites = compileTitleRewrites(options.titleRewrites);
 
     // Normalize every complete sorted-toplevel before filtering, preserving
     // fallback identity while a window is off-screen.
@@ -203,7 +247,8 @@ function bucketSnapshot(snapshot, identityState, options) {
         if (!sourceWindows[i]) continue;
         var current = _window(sourceWindows[i], compositor, identityState, {
             normalizeAppId: options.normalizeAppId || snapshot.normalizeAppId,
-            hyprlandLookup: options.hyprlandLookup
+            hyprlandLookup: options.hyprlandLookup,
+            compiledTitleRewrites: compiledTitleRewrites
         });
         if (seen.has(current.key)) { duplicateWindowKeys.push(current.key); continue; }
         seen.add(current.key);
@@ -327,7 +372,7 @@ function _cloneEntries(entries) {
     for (var i = 0; i < entries.length; i++) {
         var entry = entries[i];
         result.push({ entryKey: entry.entryKey, appId: entry.appId, isGrouped: entry.isGrouped, windows: entry.windows.slice(),
-            toplevel: entry.toplevel, title: entry.title, focused: entry.focused, activatedWindowIndex: entry.activatedWindowIndex });
+            toplevel: entry.toplevel, title: entry.title, icon: entry.icon, focused: entry.focused, activatedWindowIndex: entry.activatedWindowIndex });
     }
     return result;
 }

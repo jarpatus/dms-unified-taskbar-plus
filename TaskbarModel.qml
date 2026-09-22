@@ -7,6 +7,7 @@ QtObject {
     // Service-free boundary. The owner supplies a fresh immutable snapshot:
     // { compositor, workspaces, windows, groupByApp }.
     property var snapshot: null
+    property var titleRewrites: []
     readonly property var visibleWorkspaces: _visibleWorkspaces
     readonly property int reconcileCount: _reconcileCount
     readonly property int pendingWorkspaceCount: _pendingWorkspaceCount
@@ -39,6 +40,7 @@ QtObject {
     property Component entryComponent: EntryRecord {}
 
     onSnapshotChanged: scheduleReconcile()
+    onTitleRewritesChanged: scheduleReconcile()
 
     function _later(callback, token) {
         var lifetime = _lifetime;
@@ -144,6 +146,7 @@ QtObject {
         _setProperty(record, "toplevel", descriptor.toplevel || null);
         _setProperty(record, "focused", descriptor.focused === true);
         _setProperty(record, "title", descriptor.title || "");
+        _setProperty(record, "icon", descriptor.icon || "");
         _setProperty(record, "activatedWindowIndex", descriptor.activatedWindowIndex === undefined ? -1 : descriptor.activatedWindowIndex);
         return record;
     }
@@ -202,7 +205,7 @@ QtObject {
 
     function reconcile() {
         if (!_alive) return;
-        var bucket = Model.bucketSnapshot(snapshot || {}, _identityState, { previousBucket: _lastBucket });
+        var bucket = Model.bucketSnapshot(snapshot || {}, _identityState, { previousBucket: _lastBucket, titleRewrites: titleRewrites });
         _lastBucket = bucket;
         var nextWorkspaceKeys = new Set();
         var nextEntryKeys = new Set();

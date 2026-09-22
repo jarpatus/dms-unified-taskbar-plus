@@ -1,9 +1,9 @@
 {
-    "id": "unifiedTaskbar",
-    "name": "Unified Taskbar",
+    "id": "unifiedTaskbarPlus",
+    "name": "Unified Taskbar Plus",
     "description": "Running apps grouped by workspace with per-workspace pills",
     "version": "1.2.0",
-    "author": "Joshua Landau",
+    "author": "Jari Eskelinen",
     "type": "widget",
     "capabilities": ["dankbar-widget", "compositor-integration"],
     "component": "./UnifiedTaskbar.qml",
